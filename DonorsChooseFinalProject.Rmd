@@ -1,0 +1,553 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+# Load libraries 
+
+```{r,message=FALSE,warning=FALSE}
+
+library(tidyverse)
+library(tidymodels)
+library(janitor)
+library(skimr)
+library(kableExtra)
+library(GGally)
+library(kableExtra) 
+library(vip)        
+library(fastshap)   
+library(MASS)
+library(ISLR)
+library(tree)
+library(dplyr)
+library(ggplot2)
+library(factoextra)
+library(ggpubr)
+```
+
+# Read Data
+
+```{r,message=FALSE,warning=FALSE}
+donation = read_csv("DonorMerge_Final.csv") %>%
+  clean_names()
+donor = read.csv('Donations.csv') %>%
+  clean_names()
+donor = donor %>%
+  inner_join(donation%>%dplyr::select(projectid|is_exciting),by='projectid')
+skim(donor)
+skim(donation)
+```
+
+# Data Preparation
+
+```{r,message=FALSE,warning=FALSE}
+#variable removing
+donor_del = c('donor_zip','donationid','projectid','donor_acctid','donor_city','donation_message','donation_timestamp')
+donation_del = c('school_ncesid','projectid','teacher_acctid','schoolid','school_city','school_district','school_county','school_zip')
+donation = donation %>%
+  dplyr::select(!donation_del)
+donor = donor %>%
+  dplyr::select(!donor_del)
+
+# data transformation
+donation = donation %>%
+  mutate(date_posted = as.Date(date_posted,format='%m/%d/%Y')) %>%
+  mutate(days = as.numeric(word(round(difftime('2022-12-02',date_posted,units="days"),0)))) %>%
+  dplyr::select(!date_posted) 
+
+```
+
+#Exploring variables
+
+## Exploring target
+```{r,message=FALSE,warning=FALSE}
+summary <-  donation %>%
+  count(is_exciting) %>%
+  mutate(pct = n/sum(n))
+summary
+summary %>%
+  ggplot(aes(x=factor(is_exciting),y=pct)) +
+  geom_col()  + 
+  geom_text(aes(label = round(pct,2)) , vjust = 1, colour = "white") + 
+  labs(title="Exciting Program", x="Is Exciting", y="PCT")+theme_bw() + theme(panel.grid=element_blank())+ scale_fill_brewer(palette = 5)
+```
+## Donation exploring
+### Exploring numeric 
+```{r}
+num_explore <- function(col){
+  donation %>%
+    ggplot(., aes(x=!!as.name(col), y=factor(is_exciting))) + geom_boxplot()+theme_bw() + theme(panel.grid=element_blank())
+}
+
+# numeric_char=c('customer_service_calls','late_payments','number_phones')
+
+for (column in names(donation %>% select_if (is.numeric))){
+  if (column != 'is_exciting'){
+    num <- num_explore(column)
+    print(num)
+  }
+}
+
+# checking outliers
+
+donation %>%
+  filter(total_price_excluding_optional_s<1000) %>%
+  ggplot(., aes(x=total_price_excluding_optional_s, y=factor(is_exciting))) + 
+  geom_boxplot()
+
+donation %>%
+  filter(total_price_including_optional_s<1000) %>%
+  ggplot(., aes(x=total_price_including_optional_s, y=factor(is_exciting))) + 
+  geom_boxplot()
+
+donation %>%
+  filter(students_reached<1000) %>%
+  ggplot(., aes(x=students_reached, y=factor(is_exciting))) + 
+  geom_boxplot()
+
+# removing outliers
+donation = donation %>%
+  filter(total_price_excluding_optional_s<1000) %>%
+  filter(total_price_including_optional_s<1000) %>%
+  filter(students_reached<1000)
+```
+
+### Explore character & logical
+
+```{r, warning=FALSE, message=FALSE}
+
+char_explore <- function(col){
+  donation %>%
+    ggplot(., aes(!!as.name(col))) + 
+    geom_bar(aes(fill = factor(is_exciting)), position = "fill") +theme_bw() + theme(panel.grid=element_blank()) + scale_fill_brewer(palette = 5) +
+  coord_flip()
+}
+
+#character var
+for (column in names(donation %>% select_if(is_character))){
+    chrt <- char_explore(column)
+    print(chrt)
+}
+
+
+
+```
+## Donor exploring
+### Exploring numeric 
+```{r}
+
+
+# checking outliers
+donor%>%
+  filter(donation_to_project<200) %>%
+  ggplot(., aes(x=donation_to_project))+ geom_boxplot()
+
+# 1,048,575
+# 1,048,558 <20000
+# 1,048,535 <10000
+# 1,048,381 <5000
+# 1,045,399 <1000
+# 1,031,794 <500
+# 966,876 <200
+
+donor%>%
+  #filter(donation_optional_support<50) %>%
+  ggplot(., aes(x=donation_optional_support))+ geom_boxplot()
+
+# 1,046,169 <200
+# 1,035,724 <100
+# 999,629 <50
+
+donor%>%
+  filter(donation_total<250) %>%
+  ggplot(., aes(x=donation_total))+ geom_boxplot()
+
+# 949,651 <200
+# 973,011 <250
+
+# removing outliers
+donor = donor %>%
+  filter(donation_to_project<200) %>%
+  filter(donation_optional_support<50) %>%
+  filter(donation_total<250)
+```
+
+### Explore character & logical
+
+```{r, warning=FALSE, message=FALSE}
+
+char_explore <- function(col){
+  donor %>%
+    ggplot(., aes(!!as.name(col))) + geom_bar()+theme_bw() + 
+    theme(panel.grid=element_blank()) + 
+    scale_fill_brewer(palette = 5)
+}
+
+for (column in names(donor %>% select_if(is_character))){
+    chrt <- char_explore(column)
+    print(chrt)
+}
+
+```
+# Clustering
+## data processing
+
+```{r}
+recipe =recipe(is_exciting ~ .,
+                     data=donor) %>%
+  step_impute_median(all_numeric_predictors()) %>%
+  step_impute_mode(all_nominal_predictors()) %>%
+  step_zv(all_numeric_predictors()) %>%
+  step_scale(all_numeric_predictors()) %>%
+  step_dummy(all_nominal_predictors())
+
+donor_bake = bake(recipe %>% prep(), new_data = donor,composition = "tibble")
+skim(donor_bake)
+```
+## visually choose number of clusters
+
+```{r}
+
+set.seed(123)
+
+# -- performs our train / test split 
+split_fig <- initial_split(donor_bake, prop = 0.02)
+
+# -- extract the training data form our banana split 
+donor_fig <- training(split_fig)
+
+
+# how many clusters
+
+fviz_nbclust(donor_fig, kmeans, method="wss")
+
+```
+
+## build clusters
+
+```{r}
+set.seed(17)
+
+clusters5 <- kmeans(donor_bake, 5, iter.max = 200, nstart = 5)
+print(clusters5)
+
+
+# visualize clusters
+
+fviz_cluster(clusters5,donor_bake,ellipse.type="norm",geom="point")
+
+```
+
+## cluster detail
+```{r}
+cluster <- as.factor(clusters5$cluster)
+clusters5
+```
+
+```{r}
+tree.clusters=tree(cluster~., donor_bake)
+
+summary(tree.clusters)
+
+plot(tree.clusters)
+text(tree.clusters,pretty=0)
+
+```
+
+
+
+# Exploring cluster
+## explore cluster target
+```{r}
+ggplot(donor,aes(cluster))+geom_bar()
+```
+## explore cluster features
+```{r}
+# categorical
+ggplot(donor,aes(is_teacher_acct))+geom_bar()
+ggplot(donor,aes(is_teacher_acct))+geom_bar()+facet_wrap(~clusters5$cluster) 
+
+###
+ggplot(donor,aes(dollar_amount))+geom_bar()
+ggplot(donor,aes(dollar_amount))+geom_bar()+facet_wrap(~clusters5$cluster) 
+
+ggplot(donor,aes(payment_method))+geom_bar()
+ggplot(donor,aes(payment_method))+geom_bar()+facet_wrap(~clusters5$cluster)  +
+  theme(axis.text.x=element_text(angle=90))
+
+ggplot(donor,aes(payment_included_campaign_gift_card))+geom_bar()
+ggplot(donor,aes(payment_included_campaign_gift_card))+geom_bar()+facet_wrap(~clusters5$cluster) 
+
+ggplot(donor,aes(via_giving_page))+geom_bar()
+ggplot(donor,aes(via_giving_page))+geom_bar()+facet_wrap(~clusters5$cluster) 
+
+
+# numeric
+ggplot(donor,aes(x=donation_to_project))+geom_histogram(binwidth=10)
+ggplot(donor,aes(x=donation_to_project))+geom_histogram(binwidth=10) + facet_wrap(~clusters5$cluster)
+
+ggplot(donor,aes(x=donation_optional_support))+geom_histogram(binwidth=10)
+ggplot(donor,aes(x=donation_optional_support))+geom_histogram(binwidth=10) + facet_wrap(~clusters5$cluster)
+
+ggplot(donor,aes(x=donation_total))+geom_histogram(binwidth=10)
+ggplot(donor,aes(x=donation_total))+geom_histogram(binwidth=10) + facet_wrap(~clusters5$cluster)
+
+
+```
+
+
+# LR
+## Partition data
+
+```{r}
+set.seed(123)
+donation_lr = donation %>%
+  mutate_if(is.character, factor) %>%
+  mutate_if(is.logical,factor) %>%
+  mutate(is_exciting  = if_else(is_exciting=='TRUE',1,0)) %>%
+  mutate(is_exciting = factor(is_exciting)) 
+# -- performs our train / test split 
+split <- initial_split(donation_lr, prop = 0.7)
+
+# -- extract the training data form our banana split 
+LR_train <- training(split)
+# -- extract the test data 
+LR_test <- testing(split)
+
+sprintf("Train PCT : %1.2f%%", nrow(LR_train)/ nrow(donation_lr) * 100)
+
+```
+
+## Define Recipe 
+
+```{r}
+LR_recipe <- recipe(is_exciting ~ .,
+                     data=LR_train) %>%
+  step_impute_median(all_numeric_predictors()) %>%
+  step_impute_mode(all_nominal(), -all_outcomes()) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_other(all_nominal_predictors()) %>%
+  step_zv(all_predictors())
+                                    
+# eyeball recipe results 
+LR_train_bake = bake(LR_recipe %>% prep(), new_data = LR_train)
+LR_test_bake = bake(LR_recipe %>% prep(), new_data = LR_test)
+```
+
+## Fitting models
+```{r}
+logistic_glm <-logistic_reg(mode = "classification") %>%
+                  set_engine("glm") %>%
+                  fit(is_exciting ~ ., data=LR_train_bake)
+tidy(logistic_glm) %>%
+  mutate_at(c("estimate", "std.error", "statistic", "p.value"),round, 4) %>%
+  filter(p.value < 0.01) 
+```
+## Evaluating model
+
+```{r}
+# score training
+predict(logistic_glm , LR_train_bake, type = "prob") %>%
+  bind_cols(predict(logistic_glm , LR_train_bake, type = "class")) %>%
+  mutate(part = "train") %>%
+  bind_cols(., LR_train_bake) -> scored_train
+
+# -- score testing
+predict(logistic_glm , LR_test_bake, type = "prob") %>%
+  bind_cols(predict(logistic_glm ,  LR_test_bake, type = "class")) %>%
+  mutate(part = "testing") %>%
+  bind_cols(., LR_test_bake) -> scored_test
+
+## Metrics (AUC / Accuracy / Log Loss)
+bind_rows (scored_train, scored_test)  %>%
+  group_by(part) %>%
+  metrics(is_exciting, .pred_0, estimate = .pred_class) %>%
+  filter(.metric %in% c('accuracy', 'roc_auc', 'mn_log_loss')) %>%
+  pivot_wider(names_from = .metric, values_from = .estimate)
+
+```
+
+## Define Recipe for reduced model
+
+```{r}
+
+
+LR_steprecipe <- recipe(is_exciting ~ school_latitude	+			
+one_non_teacher_referred_donor_g				+
+great_messages_proportion				+
+teacher_referred_count				+
+non_teacher_referred_count	+			
+school_charter	+			
+teacher_teach_for_america	+			
+fulfillment_labor_materials		+		
+total_price_excluding_optional_s	+			
+total_price_including_optional_s +
+eligible_double_your_impact_matc		+		
+eligible_almost_home_match			+	
+days	+
+school_state +
+school_metro+
+resource_type,
+                     data=LR_train)%>%
+  step_impute_mode(all_nominal(), -all_outcomes()) %>%
+  step_impute_median(all_numeric()) %>%
+  step_dummy(all_nominal(), -all_outcomes()) %>%
+  prep()
+
+# eyeball recipe results 
+LR_train_bake_step = bake(LR_steprecipe %>% prep(), new_data = LR_train)
+LR_test_bake_step = bake(LR_steprecipe %>% prep(), new_data = LR_test)
+
+LR_steprecipe
+```
+
+## Fitting logistic regression
+
+```{r,warning=FALSE, message=FALSE}
+
+logistic_glm_step <-logistic_reg(mode = "classification") %>%
+                  set_engine("glm") %>%
+                  fit(is_exciting ~ ., data=LR_train_bake_step)
+
+tidy(logistic_glm_step) %>%
+  mutate_at(c("estimate", "std.error", "statistic", "p.value"),round, 4) 
+
+logistic_glm_step %>%
+  vi()
+```
+## Evaluating model
+
+```{r}
+# score training
+predict(logistic_glm_step, LR_train_bake_step, type = "prob") %>%
+  bind_cols(predict(logistic_glm_step, LR_train_bake_step, type = "class")) %>%
+  mutate(part = "train") %>%
+  bind_cols(., LR_train_bake_step) -> scored_train_step
+
+# score testing
+predict(logistic_glm_step, LR_test_bake_step, type = "prob") %>%
+  bind_cols(predict(logistic_glm_step,  LR_test_bake_step, type = "class")) %>%
+  mutate(part = "testing") %>%
+  bind_cols(., LR_test_bake_step) -> scored_test_step
+
+## Metrics (AUC / Accuracy / Log Loss)
+bind_rows (scored_train_step, scored_test_step)  %>%
+  group_by(part) %>%
+  metrics(is_exciting, .pred_0, estimate = .pred_class) %>%
+  filter(.metric %in% c('accuracy', 'roc_auc', 'mn_log_loss')) %>%
+  pivot_wider(names_from = .metric, values_from = .estimate)
+```
+
+# Random Forest
+## Partition our data 70/30 
+```{r}
+# Save the split information for an 70/30 split of the data
+bsplit <- initial_split(donation_lr, prop = 0.7)
+train <- training(bsplit) 
+
+test  <-  testing(bsplit)
+
+```
+
+## Recipe
+
+```{r}
+# write out the formula 
+
+
+donation_recipe <-
+  recipe(is_exciting ~ school_latitude	+			
+one_non_teacher_referred_donor_g				+
+great_messages_proportion				+
+teacher_referred_count				+
+non_teacher_referred_count	+			
+school_charter	+			
+teacher_teach_for_america	+			
+fulfillment_labor_materials		+		
+total_price_excluding_optional_s	+			
+total_price_including_optional_s +
+eligible_double_your_impact_matc		+		
+eligible_almost_home_match			+	
+days	+
+school_state +
+school_metro+
+resource_type,
+                     data=train) %>%
+  step_impute_median(all_numeric_predictors()) %>% # missing values numeric 
+  step_novel(all_nominal_predictors()) %>% # new factor levels 
+  step_unknown(all_nominal_predictors()) %>% # missing values 
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) %>%
+  step_nzv(all_predictors()) 
+
+## Check the recipe results m
+bake(donation_recipe %>% prep(),train %>% sample_n(1000))
+
+```
+
+## Model & Workflow
+
+```{r}
+
+rf_model <- rand_forest(trees = 100, min_n = 20) %>%
+   set_mode("classification") %>%
+   set_engine("ranger", 
+              num.threads = 8, 
+              max.depth = 10, 
+              importance="permutation")
+
+rf_workflow <- workflow() %>%
+  add_recipe(donation_recipe) %>%
+  add_model(rf_model) %>%
+  fit(train)
+
+rf_workflow %>%
+  extract_fit_parsnip() %>%
+  vi()
+
+```
+
+## Evaluating model
+### Accuracy & ROC
+```{r}
+# score training
+predict(rf_workflow, train, type = "prob") %>%
+  bind_cols(predict(rf_workflow, train, type = "class")) %>%
+  mutate(part = "train") %>%
+  bind_cols(., train) -> scored_train_step
+
+# score testing
+predict(rf_workflow, test, type = "prob") %>%
+  bind_cols(predict(rf_workflow,  test, type = "class")) %>%
+  mutate(part = "testing") %>%
+  bind_cols(., test) -> scored_test_step
+
+## Metrics (AUC / Accuracy / Log Loss)
+bind_rows (scored_train_step, scored_test_step)  %>%
+  group_by(part) %>%
+  metrics(is_exciting, .pred_0, estimate = .pred_class) %>%
+  filter(.metric %in% c('accuracy', 'roc_auc', 'mn_log_loss')) %>%
+  pivot_wider(names_from = .metric, values_from = .estimate)
+```
+
+### Precision & Recall
+
+```{r}
+scored_train_step %>%
+  precision(is_exciting, .pred_class) %>%
+  mutate(part="training") %>%
+  bind_rows(
+  scored_test_step %>%
+  precision(is_exciting, .pred_class) %>%
+    mutate(part="testing") 
+  )
+
+scored_train_step %>%
+  recall(is_exciting, .pred_class) %>%
+  mutate(part="training") %>%
+  bind_rows(
+  scored_test_step %>%
+  recall(is_exciting, .pred_class) %>%
+    mutate(part="testing") 
+  )
+```
+
